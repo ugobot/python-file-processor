@@ -1,0 +1,110 @@
+import streamlit as st
+import pandas as pd
+import json
+import re
+
+st.title("GeoJSON Processor")
+
+csv_file = st.file_uploader("Upload CSV file", type=["csv"])
+geojson_file = st.file_uploader("Upload GeoJSON file", type=["geojson","json"])
+
+# Initialize session state
+if "parcelle_json" not in st.session_state:
+    st.session_state.parcelle_json = None
+
+if "batiment_json" not in st.session_state:
+    st.session_state.batiment_json = None
+
+
+if st.button("Start Processing"):
+
+    if csv_file is None or geojson_file is None:
+        st.warning("Please upload both files.")
+        st.stop()
+
+    with st.spinner("Processing..."):
+
+        df = pd.read_csv(csv_file)
+
+        lookup = {
+            (row["Zone"], row["Function"]): {
+                "Type": row["Type"],
+                "TaxationRevenue": row["TaxationRevenue"]
+            }
+            for _, row in df.iterrows()
+        }
+
+        geojson = json.load(geojson_file)
+
+        parcelle_features = []
+        batiment_features = []
+
+        for feature in geojson["features"]:
+
+            props = feature["properties"]
+
+            func_value = props.get("Function", "")
+
+            match = re.match(r"(Zone\d+)(Function\d+)", func_value)
+
+            if match:
+                zone = match.group(1)
+                function_type = match.group(2)
+            else:
+                zone = None
+                function_type = None
+
+            props["Zone"] = zone
+            props["FunctionType"] = function_type
+
+            key = (zone, function_type)
+
+            if key in lookup:
+
+                props["TypeF"] = lookup[key]["Type"]
+
+                if props.get("Type") == "Parcelle":
+                    props["TaxationRevenue"] = lookup[key]["TaxationRevenue"]
+
+            if props.get("Type") == "Parcelle":
+                parcelle_features.append(feature)
+
+            elif props.get("Type") == "Batiment":
+                batiment_features.append(feature)
+
+        parcelle_geojson = {
+            "type": "FeatureCollection",
+            "features": parcelle_features
+        }
+
+        batiment_geojson = {
+            "type": "FeatureCollection",
+            "features": batiment_features
+        }
+
+        # Save results
+        st.session_state.parcelle_json = json.dumps(parcelle_geojson, indent=2)
+        st.session_state.batiment_json = json.dumps(batiment_geojson, indent=2)
+
+        st.success("Processing complete!")
+
+# Download buttons always visible once processed
+if st.session_state.parcelle_json and st.session_state.batiment_json:
+
+    col1, col2 = st.columns(2)
+
+    with col1:
+        st.download_button(
+            "Download Parcelle GeoJSON",
+            st.session_state.parcelle_json,
+            "parcelle.geojson",
+            "application/geo+json"
+        )
+
+    with col2:
+        st.download_button(
+            "Download Batiment GeoJSON",
+            st.session_state.batiment_json,
+            "batiment.geojson",
+            "application/geo+json"
+        )
