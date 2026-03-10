@@ -28,8 +28,8 @@ if st.button("Start Processing"):
 
         lookup = {
             (row["Zone"], row["Function"]): {
-                "Type": row["Type"],
-                "TaxationRevenue": row["TaxationRevenue"]
+                "Type": row["Type "],
+                "TaxationRevenue": row["TaxationRevenue_Land($/m2)"]
             }
             for _, row in df.iterrows()
         }
