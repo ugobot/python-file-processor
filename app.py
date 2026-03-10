@@ -24,24 +24,42 @@ if st.button("Start Processing"):
 
     with st.spinner("Processing..."):
 
+        # Read CSV
         df = pd.read_csv(csv_file)
 
+        # Clean column names (removes accidental spaces)
+        df.columns = df.columns.str.strip()
+
+        # Create lookup table
         lookup = {
             (row["Zone"], row["Function"]): {
-                "Type": row["Type "],
+                "Type": row["Type"],
                 "TaxationRevenue": row["TaxationRevenue_Land($/m2)"]
             }
             for _, row in df.iterrows()
         }
 
+        # Load GeoJSON
         geojson = json.load(geojson_file)
+
+        # Extract CRS if present
+        crs_data = geojson.get("crs")
+
+        # If CRS missing, create default EPSG:2950
+        if crs_data is None:
+            crs_data = {
+                "type": "name",
+                "properties": {
+                    "name": "urn:ogc:def:crs:EPSG::2950"
+                }
+            }
 
         parcelle_features = []
         batiment_features = []
 
-        for feature in geojson["features"]:
+        for feature in geojson.get("features", []):
 
-            props = feature["properties"]
+            props = feature.get("properties", {})
 
             func_value = props.get("Function", "")
 
@@ -72,13 +90,19 @@ if st.button("Start Processing"):
             elif props.get("Type") == "Batiment":
                 batiment_features.append(feature)
 
+        # Build Parcelle GeoJSON
         parcelle_geojson = {
             "type": "FeatureCollection",
+            "name": "parcelle",
+            "crs": crs_data,
             "features": parcelle_features
         }
 
+        # Build Batiment GeoJSON
         batiment_geojson = {
             "type": "FeatureCollection",
+            "name": "batiment",
+            "crs": crs_data,
             "features": batiment_features
         }
 
@@ -88,7 +112,7 @@ if st.button("Start Processing"):
 
         st.success("Processing complete!")
 
-# Download buttons always visible once processed
+# Download buttons
 if st.session_state.parcelle_json and st.session_state.batiment_json:
 
     col1, col2 = st.columns(2)
