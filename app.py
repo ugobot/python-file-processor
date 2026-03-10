@@ -3,7 +3,7 @@ import pandas as pd
 import json
 import re
 
-st.title("GeoJSON Processor")
+st.title("GeoJSON Processeur")
 
 csv_file = st.file_uploader("Upload CSV file", type=["csv"])
 geojson_file = st.file_uploader("Upload GeoJSON file", type=["geojson","json"])
