@@ -3,7 +3,7 @@ import pandas as pd
 import json
 import re
 from copy import deepcopy
-from shapely.geometry import shape
+from shapely.geometry import shape, mapping
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
 
@@ -40,6 +40,30 @@ def clean_value(value):
     if pd.isna(value):
         return None
     return value
+
+
+def repair_invalid_feature_geometries(geojson_data):
+    repaired_count = 0
+
+    for feature in geojson_data.get("features", []):
+        geom_json = feature.get("geometry")
+        if not geom_json:
+            continue
+
+        try:
+            geom = shape(geom_json)
+            if geom.is_empty:
+                continue
+
+            if not geom.is_valid:
+                repaired_geom = make_valid(geom)
+                if not repaired_geom.is_empty:
+                    feature["geometry"] = mapping(repaired_geom)
+                    repaired_count += 1
+        except Exception:
+            feature.setdefault("properties", {})["GeometryRepairStatus"] = "failed"
+
+    return repaired_count
 
 
 def build_column_mapping(columns):
@@ -445,6 +469,7 @@ if st.button("Start Processing"):
             lookup[(zone, function)] = row_data
 
         geojson = json.load(geojson_file)
+        repaired_count = repair_invalid_feature_geometries(geojson)
 
         crs_data = geojson.get("crs")
         if crs_data is None:
@@ -508,7 +533,10 @@ if st.button("Start Processing"):
         st.session_state.parcelle_json = json.dumps(parcelle_geojson, indent=2)
         st.session_state.batiment_json = json.dumps(batiment_geojson, indent=2)
 
-        st.success("Processing complete!")
+        if repaired_count > 0:
+            st.success(f"Processing complete! {repaired_count} invalid geometries were repaired before splitting.")
+        else:
+            st.success("Processing complete! No invalid geometries needed repair.")
 
 if st.session_state.parcelle_json and st.session_state.batiment_json:
     col1, col2 = st.columns(2)
