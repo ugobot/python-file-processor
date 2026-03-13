@@ -175,6 +175,43 @@ def fill_missing_and_null_properties(features):
                 props[key] = default_value
 
 
+
+
+def safe_numeric(value, default=0.0):
+    parsed = parse_numeric_string(value)
+    if is_real_numeric_value(parsed):
+        try:
+            return float(parsed)
+        except Exception:
+            return default
+    return default
+
+
+def compute_parcelle_far(parcelle_features, batiment_features):
+    far_by_pid = {}
+
+    for feature in batiment_features:
+        props = feature.get("properties", {})
+        parcel_pid = props.get("parcel_PID")
+        if not parcel_pid:
+            continue
+
+        num_storey = safe_numeric(props.get("NumStorey"), 0.0)
+        building_area = safe_numeric(props.get("Area"), 0.0)
+        far_by_pid[parcel_pid] = far_by_pid.get(parcel_pid, 0.0) + (num_storey * building_area)
+
+    for feature in parcelle_features:
+        props = feature.setdefault("properties", {})
+        parcel_pid = props.get("PID")
+        parcel_area = safe_numeric(props.get("Area"), 0.0)
+
+        if not parcel_pid or parcel_area <= 0:
+            props["FAR"] = 0
+            continue
+
+        gross_floor_area = far_by_pid.get(parcel_pid, 0.0)
+        props["FAR"] = gross_floor_area / parcel_area if gross_floor_area > 0 else 0
+
 def repair_invalid_feature_geometries(geojson_data):
     repaired_count = 0
 
@@ -257,13 +294,13 @@ PARCEL_FIELDS = {
     "MaxFootprint (%)",
     "TaxationRevenue_Land($/m2)",
     "MinGreenArea (%)",
+    "MaxFAR",
     "OffsetInnerPlot",
 }
 
 BUILDING_FIELDS = {
     "TaxationRevenue_Building($/m2)",
     "MaxHeight",
-    "MaxFAR",
     "ParkingDensity (Slot/Unit)",
     "MaxOccupancyRatio (People/Unit)",
     "UndergroundParking(Y/N)",
@@ -629,6 +666,7 @@ if st.button("Start Processing"):
         assign_parcel_pids(parcelle_features)
         assign_building_bids(batiment_features)
         assign_buildings_to_parcels(batiment_features, parcelle_features)
+        compute_parcelle_far(parcelle_features, batiment_features)
 
         fill_missing_and_null_properties(parcelle_features)
         fill_missing_and_null_properties(batiment_features)
