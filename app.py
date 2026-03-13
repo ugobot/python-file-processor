@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 import json
 import re
+import numbers
 from copy import deepcopy
 from shapely.geometry import shape, mapping
 from shapely.strtree import STRtree
@@ -26,11 +27,6 @@ def normalize_column_name(name):
 
 
 def sanitize_attribute_name(name):
-    """
-    Keep only letters, digits and underscores in output attribute names.
-    Example:
-    'TaxationRevenue_Building($/m2)' -> 'TaxationRevenue_Buildingm2'
-    """
     cleaned = re.sub(r"[^A-Za-z0-9_]+", "", str(name))
     cleaned = re.sub(r"_+", "_", cleaned).strip("_")
     return cleaned or "Attribute"
@@ -40,6 +36,143 @@ def clean_value(value):
     if pd.isna(value):
         return None
     return value
+
+
+def is_real_numeric_value(value):
+    if value is None:
+        return False
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, numbers.Number) or pd.api.types.is_number(value)
+
+
+def is_real_string_value(value):
+    return isinstance(value, str)
+
+
+def is_empty_string(value):
+    return isinstance(value, str) and value.strip() == ""
+
+
+def parse_numeric_string(value):
+    """
+    Convert a numeric-looking string to int or float.
+    Returns the original value if it is not a numeric-looking string.
+    """
+    if not isinstance(value, str):
+        return value
+
+    s = value.strip()
+    if s == "":
+        return value
+
+    # Supports integers, floats, scientific notation
+    numeric_pattern = r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$"
+    if not re.fullmatch(numeric_pattern, s):
+        return value
+
+    try:
+        number_value = float(s)
+        if number_value.is_integer() and re.fullmatch(r"^[+-]?\d+$", s):
+            return int(s)
+        return number_value
+    except Exception:
+        return value
+
+
+def is_numeric_like(value):
+    """
+    True for:
+    - real numeric values
+    - strings that can be converted to a number
+    """
+    if is_real_numeric_value(value):
+        return True
+
+    parsed = parse_numeric_string(value)
+    return is_real_numeric_value(parsed)
+
+
+def infer_property_types(features):
+    """
+    Infer schema per property key:
+    - numeric: all meaningful values are numeric or numeric-like strings
+    - string: at least one meaningful value is true text
+    """
+    property_types = {}
+    all_keys = set()
+
+    for feature in features:
+        props = feature.get("properties", {})
+        all_keys.update(props.keys())
+
+    for key in all_keys:
+        saw_numeric = False
+        saw_text = False
+
+        for feature in features:
+            value = feature.get("properties", {}).get(key)
+
+            if value is None or is_empty_string(value):
+                continue
+
+            if is_numeric_like(value):
+                saw_numeric = True
+            else:
+                saw_text = True
+
+        if saw_numeric and not saw_text:
+            property_types[key] = "numeric"
+        else:
+            property_types[key] = "string"
+
+    return property_types
+
+
+def normalize_property_types(features):
+    """
+    Convert numeric-like strings to real numeric values for fields inferred as numeric.
+    Empty strings become None.
+    """
+    property_types = infer_property_types(features)
+
+    for feature in features:
+        props = feature.setdefault("properties", {})
+
+        for key, field_type in property_types.items():
+            if key not in props:
+                continue
+
+            value = props.get(key)
+
+            if is_empty_string(value):
+                props[key] = None
+                continue
+
+            if field_type == "numeric" and value is not None:
+                parsed = parse_numeric_string(value)
+                if is_real_numeric_value(parsed):
+                    props[key] = parsed
+
+    return property_types
+
+
+def fill_missing_and_null_properties(features):
+    """
+    Fill missing/null values after type normalization:
+    - numeric fields -> 0
+    - string fields -> "No value"
+    """
+    property_types = normalize_property_types(features)
+
+    for feature in features:
+        props = feature.setdefault("properties", {})
+
+        for key, field_type in property_types.items():
+            default_value = 0 if field_type == "numeric" else "No value"
+
+            if key not in props or props[key] is None or is_empty_string(props[key]):
+                props[key] = default_value
 
 
 def repair_invalid_feature_geometries(geojson_data):
@@ -191,8 +324,6 @@ def get_zone_and_function_from_feature(props):
 def add_csv_attributes_to_feature(props, row_data, feature_kind):
     for field, value in row_data.items():
         value = clean_value(value)
-        if value is None:
-            continue
 
         field_scope = classify_csv_field(field)
         if field_scope not in ("common", feature_kind):
@@ -201,10 +332,10 @@ def add_csv_attributes_to_feature(props, row_data, feature_kind):
         output_key = target_output_key(field)
         props[output_key] = value
 
-    if feature_kind == "parcelle" and clean_value(row_data.get("TaxationRevenue_Land($/m2)")) is not None:
-        props["TaxationRevenue"] = row_data["TaxationRevenue_Land($/m2)"]
-    elif feature_kind == "batiment" and clean_value(row_data.get("TaxationRevenue_Building($/m2)")) is not None:
-        props["TaxationRevenue"] = row_data["TaxationRevenue_Building($/m2)"]
+    if feature_kind == "parcelle":
+        props["TaxationRevenue"] = clean_value(row_data.get("TaxationRevenue_Land($/m2)"))
+    elif feature_kind == "batiment":
+        props["TaxationRevenue"] = clean_value(row_data.get("TaxationRevenue_Building($/m2)"))
 
 
 def build_output_geojson(source_geojson, output_name, features, crs_data):
@@ -220,25 +351,18 @@ def build_output_geojson(source_geojson, output_name, features, crs_data):
     output_geojson["features"] = features
     return output_geojson
 
+
 def build_zone_code(zone_value):
-    """
-    Expected examples:
-    Zone1 -> Z1
-    zone12 -> Z12
-    """
     zone_str = str(zone_value or "").strip()
 
-    # Strict match for strings like Zone1, zone 2, ZONE-3
     match = re.search(r"\bZone\D*(\d+)\b", zone_str, flags=re.IGNORECASE)
     if match:
         return f"Z{match.group(1)}"
 
-    # Fallback: if already something like Z1
     match = re.search(r"\bZ\D*(\d+)\b", zone_str, flags=re.IGNORECASE)
     if match:
         return f"Z{match.group(1)}"
 
-    # Last-resort fallback
     digits_match = re.search(r"(\d+)", zone_str)
     if digits_match:
         return f"Z{digits_match.group(1)}"
@@ -247,18 +371,10 @@ def build_zone_code(zone_value):
 
 
 def build_type_code(type_value):
-    """
-    Examples:
-    Residential A -> RA
-    Commercial B -> CB
-    Mixed Use C -> MC   (first word initial + trailing single-letter token)
-    Residential -> R    (fallback if no trailing letter)
-    """
     type_str = str(type_value or "").strip()
     if not type_str:
         return "XX"
 
-    # Keep only alphanumeric word tokens
     tokens = re.findall(r"[A-Za-z0-9]+", type_str)
     if not tokens:
         return "XX"
@@ -267,7 +383,6 @@ def build_type_code(type_value):
     first_letter_match = re.search(r"[A-Za-z]", first_token)
     first_letter = first_letter_match.group(0).upper() if first_letter_match else "X"
 
-    # Prefer a trailing single-letter token, e.g. "A" in "Residential A"
     trailing_letter = None
     for token in reversed(tokens[1:]):
         if re.fullmatch(r"[A-Za-z]", token):
@@ -277,7 +392,6 @@ def build_type_code(type_value):
     if trailing_letter:
         return f"{first_letter}{trailing_letter}"
 
-    # Fallback: use initials of up to 2 words
     initials = []
     for token in tokens:
         m = re.search(r"[A-Za-z]", token)
@@ -515,6 +629,9 @@ if st.button("Start Processing"):
         assign_parcel_pids(parcelle_features)
         assign_building_bids(batiment_features)
         assign_buildings_to_parcels(batiment_features, parcelle_features)
+
+        fill_missing_and_null_properties(parcelle_features)
+        fill_missing_and_null_properties(batiment_features)
 
         parcelle_geojson = build_output_geojson(
             source_geojson=geojson,
