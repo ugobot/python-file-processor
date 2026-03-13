@@ -4,9 +4,10 @@ import json
 import re
 import numbers
 from copy import deepcopy
-from shapely.geometry import shape, mapping
+from shapely.geometry import shape, mapping, MultiPolygon
 from shapely.strtree import STRtree
 from shapely.validation import make_valid
+from shapely.ops import unary_union
 
 st.title("GeoJSON Processeur")
 
@@ -18,6 +19,9 @@ if "parcelle_json" not in st.session_state:
 
 if "batiment_json" not in st.session_state:
     st.session_state.batiment_json = None
+
+if "espace_vert_json" not in st.session_state:
+    st.session_state.espace_vert_json = None
 
 
 def normalize_column_name(name):
@@ -66,7 +70,6 @@ def parse_numeric_string(value):
     if s == "":
         return value
 
-    # Supports integers, floats, scientific notation
     numeric_pattern = r"^[+-]?(?:\d+\.?\d*|\.\d+)(?:[eE][+-]?\d+)?$"
     if not re.fullmatch(numeric_pattern, s):
         return value
@@ -81,11 +84,6 @@ def parse_numeric_string(value):
 
 
 def is_numeric_like(value):
-    """
-    True for:
-    - real numeric values
-    - strings that can be converted to a number
-    """
     if is_real_numeric_value(value):
         return True
 
@@ -94,11 +92,6 @@ def is_numeric_like(value):
 
 
 def infer_property_types(features):
-    """
-    Infer schema per property key:
-    - numeric: all meaningful values are numeric or numeric-like strings
-    - string: at least one meaningful value is true text
-    """
     property_types = {}
     all_keys = set()
 
@@ -130,10 +123,6 @@ def infer_property_types(features):
 
 
 def normalize_property_types(features):
-    """
-    Convert numeric-like strings to real numeric values for fields inferred as numeric.
-    Empty strings become None.
-    """
     property_types = infer_property_types(features)
 
     for feature in features:
@@ -158,11 +147,6 @@ def normalize_property_types(features):
 
 
 def fill_missing_and_null_properties(features):
-    """
-    Fill missing/null values after type normalization:
-    - numeric fields -> 0
-    - string fields -> "No value"
-    """
     property_types = normalize_property_types(features)
 
     for feature in features:
@@ -173,8 +157,6 @@ def fill_missing_and_null_properties(features):
 
             if key not in props or props[key] is None or is_empty_string(props[key]):
                 props[key] = default_value
-
-
 
 
 def safe_numeric(value, default=0.0):
@@ -211,6 +193,7 @@ def compute_parcelle_far(parcelle_features, batiment_features):
 
         gross_floor_area = far_by_pid.get(parcel_pid, 0.0)
         props["FAR"] = gross_floor_area / parcel_area if gross_floor_area > 0 else 0
+
 
 def repair_invalid_feature_geometries(geojson_data):
     repaired_count = 0
@@ -582,6 +565,206 @@ def assign_buildings_to_parcels(batiment_features, parcelle_features):
             props["ParcelMatchStatus"] = "unmatched"
 
 
+def polygon_components(geom):
+    if geom.is_empty:
+        return []
+
+    if geom.geom_type == "Polygon":
+        return [geom]
+
+    if geom.geom_type == "MultiPolygon":
+        return [g for g in geom.geoms if not g.is_empty and g.area > 0]
+
+    if hasattr(geom, "geoms"):
+        parts = []
+        for part in geom.geoms:
+            parts.extend(polygon_components(part))
+        return parts
+
+    return []
+
+
+def create_component_green_polygon(component, target_area, max_iter=50):
+    if component.is_empty or target_area <= 0:
+        return None
+
+    component = make_valid(component)
+    if component.is_empty:
+        return None
+
+    if target_area >= component.area * 0.999999:
+        return component
+
+    center = component.representative_point()
+    minx, miny, maxx, maxy = component.bounds
+    max_dimension = max(maxx - minx, maxy - miny)
+
+    if max_dimension <= 0:
+        return None
+
+    low = 0.0
+    high = max_dimension
+    best = None
+    best_error = float("inf")
+
+    for _ in range(max_iter):
+        radius = (low + high) / 2.0
+        circle = center.buffer(radius, resolution=32)
+        candidate = component.intersection(circle)
+        area = candidate.area
+        error = abs(area - target_area)
+
+        if not candidate.is_empty and error < best_error:
+            best = candidate
+            best_error = error
+
+        if area < target_area:
+            low = radius
+        else:
+            high = radius
+
+    return best
+
+
+def build_building_geometries_by_parcel(batiment_features):
+    building_geoms_by_parcel = {}
+
+    for feature in batiment_features:
+        props = feature.get("properties", {})
+        parcel_pid = props.get("parcel_PID")
+        geom_json = feature.get("geometry")
+
+        if not parcel_pid or not geom_json:
+            continue
+
+        try:
+            geom = shape(geom_json)
+            if geom.is_empty:
+                continue
+            if not geom.is_valid:
+                geom = make_valid(geom)
+
+            building_geoms_by_parcel.setdefault(parcel_pid, []).append(geom)
+        except Exception:
+            continue
+
+    return building_geoms_by_parcel
+
+
+def create_green_space_geometry(parcel_geom, building_geoms, green_ratio):
+    if parcel_geom.is_empty:
+        return None
+
+    parcel_geom = make_valid(parcel_geom)
+    if parcel_geom.is_empty:
+        return None
+
+    green_ratio = max(0.0, min(safe_numeric(green_ratio, 0.0), 1.0))
+    target_area = parcel_geom.area * green_ratio
+
+    if target_area <= 0:
+        return None
+
+    if building_geoms:
+        building_union = unary_union(building_geoms)
+        available_geom = parcel_geom.difference(building_union)
+    else:
+        available_geom = parcel_geom
+
+    available_geom = make_valid(available_geom)
+    components = polygon_components(available_geom)
+
+    if not components:
+        return None
+
+    available_area = sum(component.area for component in components)
+    if available_area <= 0:
+        return None
+
+    if target_area >= available_area * 0.999999:
+        if len(components) == 1:
+            return components[0]
+        return MultiPolygon(components)
+
+    green_parts = []
+    remaining_target = target_area
+    remaining_available_area = available_area
+
+    sorted_components = sorted(components, key=lambda geom: geom.area, reverse=True)
+
+    for index, component in enumerate(sorted_components):
+        component_area = component.area
+        if component_area <= 0 or remaining_target <= 0:
+            continue
+
+        if index == len(sorted_components) - 1 or remaining_available_area <= 0:
+            component_target = min(remaining_target, component_area)
+        else:
+            proportional_target = remaining_target * (component_area / remaining_available_area)
+            component_target = min(component_area, proportional_target)
+
+        green_piece = create_component_green_polygon(component, component_target)
+
+        if green_piece is not None and not green_piece.is_empty:
+            green_parts.extend(polygon_components(green_piece))
+            remaining_target -= green_piece.area
+
+        remaining_available_area -= component_area
+
+    if not green_parts:
+        return None
+
+    return unary_union(green_parts)
+
+
+def generate_espace_vert_features(parcelle_features, batiment_features):
+    espace_vert_features = []
+    building_geoms_by_parcel = build_building_geometries_by_parcel(batiment_features)
+
+    for feature in parcelle_features:
+        props = feature.get("properties", {})
+        geom_json = feature.get("geometry")
+        parcel_pid = props.get("PID")
+
+        if not geom_json or not parcel_pid:
+            continue
+
+        try:
+            parcel_geom = shape(geom_json)
+            if parcel_geom.is_empty:
+                continue
+            if not parcel_geom.is_valid:
+                parcel_geom = make_valid(parcel_geom)
+        except Exception:
+            continue
+
+        green_ratio = props.get("RatioEspaceVert", 0)
+        green_geom = create_green_space_geometry(
+            parcel_geom=parcel_geom,
+            building_geoms=building_geoms_by_parcel.get(parcel_pid, []),
+            green_ratio=green_ratio,
+        )
+
+        if green_geom is None or green_geom.is_empty:
+            continue
+
+        espace_vert_feature = {
+            "type": "Feature",
+            "geometry": mapping(green_geom),
+            "properties": {
+                "ID": f"{parcel_pid}_EV_1",
+                "Zone": props.get("Zone"),
+                "CsvType": props.get("CsvType"),
+                "parcel_ID": parcel_pid,
+                "RatioEspaceVert": safe_numeric(green_ratio, 0.0),
+                "Area": green_geom.area,
+            },
+        }
+        espace_vert_features.append(espace_vert_feature)
+
+    return espace_vert_features
+
+
 if st.button("Start Processing"):
 
     if csv_file is None or geojson_file is None:
@@ -671,6 +854,9 @@ if st.button("Start Processing"):
         fill_missing_and_null_properties(parcelle_features)
         fill_missing_and_null_properties(batiment_features)
 
+        espace_vert_features = generate_espace_vert_features(parcelle_features, batiment_features)
+        fill_missing_and_null_properties(espace_vert_features)
+
         parcelle_geojson = build_output_geojson(
             source_geojson=geojson,
             output_name="parcelle",
@@ -685,16 +871,30 @@ if st.button("Start Processing"):
             crs_data=crs_data,
         )
 
+        espace_vert_geojson = build_output_geojson(
+            source_geojson=geojson,
+            output_name="espace_vert",
+            features=espace_vert_features,
+            crs_data=crs_data,
+        )
+
         st.session_state.parcelle_json = json.dumps(parcelle_geojson, indent=2)
         st.session_state.batiment_json = json.dumps(batiment_geojson, indent=2)
+        st.session_state.espace_vert_json = json.dumps(espace_vert_geojson, indent=2)
 
         if repaired_count > 0:
-            st.success(f"Processing complete! {repaired_count} invalid geometries were repaired before splitting.")
+            st.success(
+                f"Processing complete! {repaired_count} invalid geometries were repaired before splitting."
+            )
         else:
             st.success("Processing complete! No invalid geometries needed repair.")
 
-if st.session_state.parcelle_json and st.session_state.batiment_json:
-    col1, col2 = st.columns(2)
+if (
+    st.session_state.parcelle_json
+    and st.session_state.batiment_json
+    and st.session_state.espace_vert_json
+):
+    col1, col2, col3 = st.columns(3)
 
     with col1:
         st.download_button(
@@ -709,5 +909,13 @@ if st.session_state.parcelle_json and st.session_state.batiment_json:
             "Download Batiment GeoJSON",
             st.session_state.batiment_json,
             "batiment.geojson",
+            "application/geo+json"
+        )
+
+    with col3:
+        st.download_button(
+            "Download Espace Vert GeoJSON",
+            st.session_state.espace_vert_json,
+            "espace_vert.geojson",
             "application/geo+json"
         )
