@@ -12,7 +12,7 @@ from shapely.ops import unary_union
 st.title("GeoJSON Processeur")
 
 csv_file = st.file_uploader("Upload CSV file", type=["csv"])
-geojson_file = st.file_uploader("Upload GeoJSON file", type=["geojson", "json"])
+geojson_files = st.file_uploader("Upload GeoJSON file(s)", type=["geojson", "json"], accept_multiple_files=True)
 
 if "parcelle_json" not in st.session_state:
     st.session_state.parcelle_json = None
@@ -40,6 +40,68 @@ def clean_value(value):
     if pd.isna(value):
         return None
     return value
+
+
+def merge_geojson_inputs(geojson_files):
+    merged_features = []
+    all_property_keys = []
+    seen_property_keys = set()
+    merged_name_parts = []
+    crs_data = None
+    top_level_template = None
+
+    for uploaded_file in geojson_files:
+        geojson_data = json.load(uploaded_file)
+
+        if top_level_template is None:
+            top_level_template = deepcopy(geojson_data)
+
+        geojson_name = geojson_data.get("name") or getattr(uploaded_file, "name", "geojson")
+        merged_name_parts.append(str(geojson_name))
+
+        if crs_data is None and geojson_data.get("crs") is not None:
+            crs_data = deepcopy(geojson_data.get("crs"))
+
+        for source_feature in geojson_data.get("features", []):
+            props = source_feature.get("properties", {}) or {}
+            for key in props.keys():
+                if key not in seen_property_keys:
+                    seen_property_keys.add(key)
+                    all_property_keys.append(key)
+
+        for source_feature in geojson_data.get("features", []):
+            feature = deepcopy(source_feature)
+            props = deepcopy(feature.get("properties", {}) or {})
+            props["file_origin"] = getattr(uploaded_file, "name", geojson_name)
+            feature["properties"] = props
+            merged_features.append(feature)
+
+    if not geojson_files:
+        return None, None, None
+
+    all_property_keys_with_origin = list(all_property_keys)
+    if "file_origin" not in seen_property_keys:
+        all_property_keys_with_origin.append("file_origin")
+
+    for feature in merged_features:
+        props = feature.setdefault("properties", {})
+        normalized_props = {key: props.get(key, None) for key in all_property_keys_with_origin}
+        feature["properties"] = normalized_props
+
+    if top_level_template is None:
+        top_level_template = {"type": "FeatureCollection"}
+
+    merged_geojson = {}
+    for key, value in top_level_template.items():
+        if key == "features":
+            continue
+        merged_geojson[key] = deepcopy(value)
+
+    merged_geojson["type"] = "FeatureCollection"
+    merged_geojson["name"] = " + ".join(merged_name_parts) if merged_name_parts else "merged_geojson"
+    merged_geojson["features"] = merged_features
+
+    return merged_geojson, crs_data, merged_features
 
 
 def is_real_numeric_value(value):
@@ -561,8 +623,8 @@ def assign_buildings_to_parcels(batiment_features, parcelle_features):
         props = feature.setdefault("properties", {})
         matched_pid = find_matching_parcel_pid(feature, parcel_tree, parcel_geoms, parcel_pids)
         props["parcel_PID"] = matched_pid
-        if matched_pid is None:
-            props["ParcelMatchStatus"] = "unmatched"
+        # if matched_pid is None:
+        #     props["ParcelMatchStatus"] = "unmatched"
 
 
 def polygon_components(geom):
@@ -767,8 +829,8 @@ def generate_espace_vert_features(parcelle_features, batiment_features):
 
 if st.button("Start Processing"):
 
-    if csv_file is None or geojson_file is None:
-        st.warning("Please upload both files.")
+    if csv_file is None or not geojson_files:
+        st.warning("Please upload the CSV file and at least one GeoJSON file.")
         st.stop()
 
     with st.spinner("Processing..."):
@@ -802,10 +864,9 @@ if st.button("Start Processing"):
 
             lookup[(zone, function)] = row_data
 
-        geojson = json.load(geojson_file)
+        geojson, crs_data, _ = merge_geojson_inputs(geojson_files)
         repaired_count = repair_invalid_feature_geometries(geojson)
 
-        crs_data = geojson.get("crs")
         if crs_data is None:
             crs_data = {
                 "type": "name",
