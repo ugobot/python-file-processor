@@ -961,7 +961,7 @@ if (
         st.download_button(
             "Download Parcelle GeoJSON",
             st.session_state.parcelle_json,
-            "parcelle.geojson",
+            "simulation_parcelle.geojson",
             "application/geo+json"
         )
 
@@ -969,7 +969,7 @@ if (
         st.download_button(
             "Download Batiment GeoJSON",
             st.session_state.batiment_json,
-            "batiment.geojson",
+            "simulation_batiment.geojson",
             "application/geo+json"
         )
 
@@ -977,6 +977,6 @@ if (
         st.download_button(
             "Download Espace Vert GeoJSON",
             st.session_state.espace_vert_json,
-            "espace_vert.geojson",
+            "simulation_espace_vert.geojson",
             "application/geo+json"
         )
